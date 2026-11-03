@@ -3997,7 +3997,7 @@ enum XMPPStreamConfig
 
         [registerElement addChild:device];
         NSString * elementId = [self generateUUID];
-        XMPPIQ *iq = [XMPPIQ iqWithType:@"set" elementID:elementId];
+        XMPPIQ *iq = [XMPPIQ iqWithType:@"set" to:[[self myJID] bareJID] elementID:elementId];
         [iq addChild:registerElement];
 
         NSString *outgoingStr = [iq compactXMLString];
