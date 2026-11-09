@@ -3,7 +3,7 @@
 #import "XMPPInternal.h"
 #import "XMPPTimer.h"
 #import "XMPPLogging.h"
-#import "NSNumber+XMPP.h"
+#include <math.h>
 
 #if ! __has_feature(objc_arc)
 #warning This file must be compiled with ARC. Use -fobjc-arc flag (or convert project to ARC).
@@ -29,6 +29,62 @@
 **/
 #define return_from_block return
 
+static BOOL ParseSMHandledCount(NSString *value, uint32_t *result)
+{
+	if (value.length == 0) {
+		return NO;
+	}
+
+	uint64_t parsed = 0;
+	for (NSUInteger index = 0; index < value.length; index++) {
+		unichar digit = [value characterAtIndex:index];
+		if (digit < '0' || digit > '9') {
+			return NO;
+		}
+		parsed = parsed * 10 + (digit - '0');
+		if (parsed > UINT32_MAX) {
+			return NO;
+		}
+	}
+	*result = (uint32_t)parsed;
+	return YES;
+}
+
+@implementation XMPPStreamManagementResumeCheckpoint
+
+- (instancetype)initWithResumptionID:(NSString *)resumptionID
+                             timeout:(uint32_t)timeout
+                      lastDisconnect:(NSDate *)lastDisconnect
+                 lastHandledByClient:(uint32_t)lastHandledByClient
+                 lastHandledByServer:(uint32_t)lastHandledByServer
+                            boundJID:(NSString *)boundJID
+{
+	if ((self = [super init])) {
+		_resumptionID = [resumptionID copy];
+		_timeout = timeout;
+		_lastDisconnect = [lastDisconnect copy];
+		_lastHandledByClient = lastHandledByClient;
+		_lastHandledByServer = lastHandledByServer;
+		_boundJID = [boundJID copy];
+	}
+	return self;
+}
+
+@end
+
+@interface XMPPStreamManagementStagedResume : NSObject
+@property (nonatomic, strong) XMPPStreamManagementResumeCheckpoint *checkpoint;
+@property (nonatomic, copy) BOOL (^consume)(void);
+@end
+
+@implementation XMPPStreamManagementStagedResume
+@end
+
+@interface XMPPStreamManagement ()
+// Shared between the module queue and the stream's custom binding callbacks.
+@property (atomic, strong, nullable) XMPPStreamManagementStagedResume *stagedResume;
+@property (atomic, strong, nullable) XMPPStreamManagementResumeCheckpoint *attemptedCheckpoint;
+@end
 
 @implementation XMPPStreamManagement
 {
@@ -46,6 +102,9 @@
 	
 	BOOL didAttemptResume;
 	BOOL didResume;
+	BOOL didResumeFromCheckpoint;
+	BOOL checkpointCountersValid;
+	NSString *boundJID;
 	
 	NSXMLElement *resume_response;
 	NSArray *resume_stanzaIds;
@@ -129,9 +188,15 @@
 	[xmppStream registerCustomElementNames:[self xep0198Elements]];
 }
 
-- (void)didDeactivate
+- (void)willDeactivate
 {
 	[xmppStream unregisterCustomElementNames:[self xep0198Elements]];
+	self.stagedResume = nil;
+	checkpointCountersValid = NO;
+	boundJID = nil;
+	[unackedByServer removeAllObjects];
+	[unackedByClient removeAllObjects];
+	[self resetAfterDisconnect];
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -385,7 +450,7 @@
                                 timeout:(uint32_t)timeout
                          lastDisconnect:(NSDate *)lastDisconnect
 {
-	if (resumptionId == nil) {
+	if (resumptionId.length == 0) {
 		XMPPLogVerbose(@"%@: Cannot resume stream: resumptionId is nil", THIS_FILE);
 		return NO;
 	}
@@ -396,18 +461,77 @@
 	
 	NSTimeInterval elapsed = [lastDisconnect timeIntervalSinceNow] * -1.0;
 	
-	if (elapsed < 0.0) // lastDisconnect is in the future ?
+	if (!isfinite(elapsed) || elapsed < 0.0)
 	{
 		XMPPLogVerbose(@"%@: Cannot resume stream: invalid lastDisconnect - appears to be in future", THIS_FILE);
 		return NO;
 	}
-	if (timeout > 0 && (uint32_t)elapsed > timeout) // too much time has elapsed
+	if (timeout > 0 && elapsed > timeout)
 	{
-		XMPPLogVerbose(@"%@: Cannot resume stream: elapsed(%u) > timeout(%u)", THIS_FILE, (uint32_t)elapsed, timeout);
+		XMPPLogVerbose(@"%@: Cannot resume stream: elapsed(%.0f) > timeout(%u)", THIS_FILE, elapsed, timeout);
 		return NO;
 	}
 	
 	return YES;
+}
+
+- (BOOL)restoreResumeCheckpoint:(XMPPStreamManagementResumeCheckpoint *)checkpoint
+                        consume:(BOOL (^)(void))consume
+{
+	__block BOOL result = NO;
+	dispatch_block_t block = ^{
+		XMPPStream *stream = self->xmppStream;
+		XMPPJID *jid = [XMPPJID jidWithString:checkpoint.boundJID];
+		if (!self->storage || !stream.isDisconnected || self->isStarted ||
+		    self.attemptedCheckpoint || !consume ||
+		    jid.resource.length == 0 || ![jid.bare isEqualToString:stream.myJID.bare] ||
+		    checkpoint.timeout == 0 ||
+		    ![self canResumeStreamWithResumptionId:checkpoint.resumptionID
+		                                  timeout:checkpoint.timeout
+		                           lastDisconnect:checkpoint.lastDisconnect]) {
+			return;
+		}
+		XMPPStreamManagementStagedResume *staged = [[XMPPStreamManagementStagedResume alloc] init];
+		staged.checkpoint = checkpoint;
+		staged.consume = consume;
+		self.stagedResume = staged;
+		result = YES;
+	};
+
+	if (dispatch_get_specific(moduleQueueTag))
+		block();
+	else
+		dispatch_sync(moduleQueue, block);
+	return result;
+}
+
+- (void)discardResumeCheckpoint
+{
+	dispatch_block_t block = ^{
+		self.stagedResume = nil;
+		self->checkpointCountersValid = NO;
+		self->boundJID = nil;
+		if (self->xmppStream) {
+			[self->storage removeAllForStream:self->xmppStream];
+		}
+	};
+	if (dispatch_get_specific(moduleQueueTag))
+		block();
+	else
+		dispatch_sync(moduleQueue, block);
+}
+
+- (void)unstageResumeCheckpoint
+{
+	dispatch_block_t block = ^{
+		if (self->xmppStream.isDisconnected && !self.attemptedCheckpoint) {
+			self.stagedResume = nil;
+		}
+	};
+	if (dispatch_get_specific(moduleQueueTag))
+		block();
+	else
+		dispatch_sync(moduleQueue, block);
 }
 
 /**
@@ -427,6 +551,14 @@
 	dispatch_block_t block = ^{ @autoreleasepool{
 		
 		if (self->isStarted || self->enableQueued || self->enableSent) {
+			return_from_block;
+		}
+
+		XMPPStreamManagementResumeCheckpoint *checkpoint = self.stagedResume.checkpoint;
+		if (checkpoint) {
+			result = [self canResumeStreamWithResumptionId:checkpoint.resumptionID
+			                                       timeout:checkpoint.timeout
+			                                lastDisconnect:checkpoint.lastDisconnect];
 			return_from_block;
 		}
 		
@@ -454,10 +586,15 @@
  * Internal method that handles sending the <resume/> element, and the corresponding state transition.
 **/
 - (void)sendResumeRequestWithResumptionId:(NSString *)resumptionId
+                              checkpoint:(nullable XMPPStreamManagementResumeCheckpoint *)checkpoint
 {
 	XMPPLogTrace();
 	
+	XMPPStream *stream = xmppStream;
 	dispatch_block_t block = ^{ @autoreleasepool {
+		if (self->xmppStream != stream) {
+			return;
+		}
 		
 		// State transition cleanup
 		
@@ -478,10 +615,27 @@
 		uint32_t newLastHandledByServer = 0;
 		NSArray *pendingOutgoingStanzas = nil;
 		
-		[self->storage getLastHandledByClient:&newLastHandledByClient
-						  lastHandledByServer:&newLastHandledByServer
-					   pendingOutgoingStanzas:&pendingOutgoingStanzas
-									forStream:self->xmppStream];
+		if (checkpoint) {
+			newLastHandledByClient = checkpoint.lastHandledByClient;
+			newLastHandledByServer = checkpoint.lastHandledByServer;
+			self->boundJID = checkpoint.boundJID;
+			self->checkpointCountersValid = YES;
+			[self->storage setResumptionId:resumptionId
+			                       timeout:checkpoint.timeout
+			                lastDisconnect:checkpoint.lastDisconnect
+			                     forStream:self->xmppStream];
+			[self->storage setLastDisconnect:checkpoint.lastDisconnect
+			              lastHandledByClient:newLastHandledByClient
+			              lastHandledByServer:newLastHandledByServer
+			           pendingOutgoingStanzas:nil
+			                        forStream:self->xmppStream];
+		}
+		else {
+			[self->storage getLastHandledByClient:&newLastHandledByClient
+			                  lastHandledByServer:&newLastHandledByServer
+			               pendingOutgoingStanzas:&pendingOutgoingStanzas
+			                            forStream:self->xmppStream];
+		}
 		
 		self->lastHandledByClient = newLastHandledByClient;
 		self->lastHandledByServer = newLastHandledByServer;
@@ -501,9 +655,8 @@
 		[resume addAttributeWithName:@"previd" stringValue:resumptionId];
 		[resume addAttributeWithName:@"h" stringValue:[NSString stringWithFormat:@"%u", self->lastHandledByClient]];
 		
-		[self->xmppStream sendBindElement:resume];
-		
 		self->didAttemptResume = YES;
+		[stream sendBindElement:resume];
 	}};
 	
 	if (dispatch_get_specific(moduleQueueTag))
@@ -515,19 +668,23 @@
 /**
  * Internal method to handle processing a resumed response from the server.
 **/
-- (void)processResumed:(NSXMLElement *)resumed
+- (void)processResumed:(NSXMLElement *)resumed fromCheckpoint:(BOOL)fromCheckpoint
 {
 	XMPPLogTrace();
 	
+	XMPPStream *stream = xmppStream;
 	dispatch_block_t block = ^{ @autoreleasepool {
+		if (self->xmppStream != stream) {
+			return;
+		}
 		
-		uint32_t h = [resumed attributeUInt32ValueForName:@"h" withDefaultValue:self->lastHandledByServer];
-		
-		uint32_t diff;
-		if (h >= self->lastHandledByServer)
-			diff = h - self->lastHandledByServer;
-		else
-			diff = (UINT32_MAX - self->lastHandledByServer) + h;
+		uint32_t h = self->lastHandledByServer;
+		BOOL validH = ParseSMHandledCount([resumed attributeStringValueForName:@"h"], &h);
+		uint32_t diff = h - self->lastHandledByServer;
+		// The existing warm resume path does not replay an unacknowledged suffix.
+		// Such a session cannot later prove an empty outgoing queue for cold resume.
+		self->checkpointCountersValid = self->checkpointCountersValid && validH &&
+		                               diff == [self->prev_unackedByServer count] && stream.isSecure;
 		
 		// IMPORTATNT:
 		// This code path uses prev_unackedByServer (NOT unackedByServer).
@@ -560,6 +717,7 @@
 		
 		self->isStarted = YES;
 		self->didResume = YES;
+		self->didResumeFromCheckpoint = fromCheckpoint;
 		
 		self->prev_unackedByServer = nil;
 		
@@ -606,6 +764,19 @@
 	else
 		dispatch_sync(moduleQueue, block);
 	
+	return result;
+}
+
+- (BOOL)didResumeFromCheckpoint
+{
+	__block BOOL result = NO;
+	dispatch_block_t block = ^{
+		result = self->didResumeFromCheckpoint;
+	};
+	if (dispatch_get_specific(moduleQueueTag))
+		block();
+	else
+		dispatch_sync(moduleQueue, block);
 	return result;
 }
 
@@ -680,6 +851,35 @@
 - (XMPPBindResult)start:(NSError **)errPtr
 {
 	XMPPLogTrace();
+
+	XMPPStreamManagementStagedResume *staged = self.stagedResume;
+	if (staged) {
+		XMPPStreamManagementResumeCheckpoint *checkpoint = staged.checkpoint;
+		self.stagedResume = nil;
+		if (!staged.consume()) {
+			[self clearFailedResume:nil];
+			if (errPtr) {
+				*errPtr = [NSError errorWithDomain:XMPPStreamErrorDomain
+				                              code:XMPPStreamInvalidState
+				                          userInfo:@{NSLocalizedDescriptionKey: @"Unable to retire the stored Stream Management checkpoint."}];
+			}
+			return XMPPBindResultFailAbort;
+		}
+
+		XMPPJID *previousJID = [XMPPJID jidWithString:checkpoint.boundJID];
+		if (!xmppStream.isSecure || !xmppStream.supportsStreamManagement ||
+		    ![previousJID.bare isEqualToString:xmppStream.myJID.bare] ||
+		    ![self canResumeStreamWithResumptionId:checkpoint.resumptionID
+		                                  timeout:checkpoint.timeout
+		                           lastDisconnect:checkpoint.lastDisconnect]) {
+			[self clearFailedResume:nil];
+			return XMPPBindResultFailFallback;
+		}
+
+		self.attemptedCheckpoint = checkpoint;
+		[self sendResumeRequestWithResumptionId:checkpoint.resumptionID checkpoint:checkpoint];
+		return XMPPBindResultContinue;
+	}
 		
 	// Fetch the resumptionId,
 	// and check to see if we can resume the stream.
@@ -699,9 +899,26 @@
 	}
 	
 	// Start the resume proces
-	[self sendResumeRequestWithResumptionId:resumptionId];
+	[self sendResumeRequestWithResumptionId:resumptionId checkpoint:nil];
 	
 	return XMPPBindResultContinue;
+}
+
+- (void)clearFailedResume:(nullable NSXMLElement *)response
+{
+	XMPPStream *stream = xmppStream;
+	dispatch_async(moduleQueue, ^{
+		if (self->xmppStream != stream) {
+			return;
+		}
+		self->didResume = NO;
+		self->didResumeFromCheckpoint = NO;
+		self->checkpointCountersValid = NO;
+		self->resume_response = response;
+		self->boundJID = nil;
+		self->prev_unackedByServer = nil;
+		[self->storage removeAllForStream:self->xmppStream];
+	});
 }
 
 /**
@@ -717,30 +934,44 @@
 {
 	XMPPLogTrace();
 	
-	NSString *elementName = [element name];
-	
-	if ([elementName isEqualToString:@"resumed"])
+	NSString *elementName = [element localName];
+	BOOL isSM = [[element URI] isEqualToString:XMLNS_STREAM_MANAGEMENT];
+	XMPPStreamManagementResumeCheckpoint *checkpoint = self.attemptedCheckpoint;
+	self.attemptedCheckpoint = nil;
+
+	if (isSM && [elementName isEqualToString:@"resumed"])
 	{
-		[self processResumed:element];
+		if (checkpoint) {
+			uint32_t h = 0;
+			if (![[element attributeStringValueForName:@"previd"] isEqualToString:checkpoint.resumptionID] ||
+			    !ParseSMHandledCount([element attributeStringValueForName:@"h"], &h) ||
+			    h != checkpoint.lastHandledByServer) {
+				[self clearFailedResume:nil];
+				if (errPtr) {
+					*errPtr = [NSError errorWithDomain:XMPPStreamErrorDomain
+					                              code:XMPPStreamInvalidState
+					                          userInfo:@{NSLocalizedDescriptionKey: @"Invalid response to Stream Management checkpoint resumption."}];
+				}
+				return XMPPBindResultFailAbort;
+			}
+			[xmppStream setMyJID_setByServer:[XMPPJID jidWithString:checkpoint.boundJID]];
+		}
+		[self processResumed:element fromCheckpoint:checkpoint != nil];
 		
 		return XMPPBindResultSuccess;
 	}
-	else
-	{
-		if (![elementName isEqualToString:@"failed"]) {
-			XMPPLogError(@"%@: Received unrecognized response from server: %@", THIS_METHOD, element);
+
+	BOOL rejected = isSM && [elementName isEqualToString:@"failed"];
+	[self clearFailedResume:rejected ? element : nil];
+	if (checkpoint && !rejected) {
+		if (errPtr) {
+			*errPtr = [NSError errorWithDomain:XMPPStreamErrorDomain
+			                              code:XMPPStreamInvalidState
+			                          userInfo:@{NSLocalizedDescriptionKey: @"Unexpected Stream Management checkpoint response."}];
 		}
-		
-		dispatch_async(moduleQueue, ^{ @autoreleasepool {
-			
-			self->didResume = NO;
-			self->resume_response = element;
-			
-			self->prev_unackedByServer = nil;
-		}});
-		
-		return XMPPBindResultFailFallback;
+		return XMPPBindResultFailAbort;
 	}
+	return XMPPBindResultFailFallback;
 }
 
 /**
@@ -921,6 +1152,9 @@
 			}
 			
 			dispatch_async(self->moduleQueue, ^{ @autoreleasepool{
+				if ([self->unackedByServer indexOfObjectIdenticalTo:stanza] == NSNotFound) {
+					return;
+				}
 				
 				// Set the stanzaId.
 				stanza.stanzaId = stanzaId;
@@ -982,17 +1216,14 @@
 	XMPPLogTrace();
 	
 	uint32_t h = 0;
-	if (![NSNumber xmpp_parseString:[ack attributeStringValueForName:@"h"] intoUInt32:&h])
+	if (!ParseSMHandledCount([ack attributeStringValueForName:@"h"], &h))
 	{
-		XMPPLogError(@"Error parsing h value from ack: %@", [ack compactXMLString]);
+		checkpointCountersValid = NO;
+		XMPPLogError(@"Invalid h value in Stream Management ack");
 		return YES;
 	}
 	
-	uint32_t diff;
-	if (h >= lastHandledByServer)
-		diff = h - lastHandledByServer;
-	else
-		diff = (UINT32_MAX - lastHandledByServer) + h;
+	uint32_t diff = h - lastHandledByServer;
 	
 	if (diff == 0)
 	{
@@ -1002,6 +1233,7 @@
 	
 	if (diff > [unackedByServer count])
 	{
+		checkpointCountersValid = NO;
 		XMPPLogWarn(@"Unexpected h value from ack: lastH=%lu, newH=%lu, numPendingStanzas=%lu",
 		            (unsigned long)lastHandledByServer,
 		            (unsigned long)h,
@@ -1444,6 +1676,9 @@
 			
 			dispatch_async(self->moduleQueue, ^{ @autoreleasepool
 			{
+				if ([self->unackedByClient indexOfObjectIdenticalTo:stanza] == NSNotFound) {
+					return;
+				}
 				if (isHandled)
 				{
 					stanza.isHandled = YES;
@@ -1707,9 +1942,13 @@
 {
 	XMPPLogTrace();
 	
+	if (sender != xmppStream || ![[element URI] isEqualToString:XMLNS_STREAM_MANAGEMENT]) {
+		return;
+	}
+	NSString *elementName = [element localName];
 	if (enableQueued)
 	{
-		if ([[element name] isEqualToString:@"enable"])
+		if ([elementName isEqualToString:@"enable"])
 		{
 			enableQueued = NO;
 			enableSent = YES;
@@ -1717,7 +1956,7 @@
 	}
 	else if (isStarted)
 	{
-		if ([[element name] isEqualToString:@"r"])
+		if ([elementName isEqualToString:@"r"])
 		{
 			[multicastDelegate xmppStreamManagementDidRequestAck:self];
 		}
@@ -1728,7 +1967,10 @@
 {
 	XMPPLogTrace();
 	
-	NSString *elementName = [element name];
+	if (sender != xmppStream || ![[element URI] isEqualToString:XMLNS_STREAM_MANAGEMENT]) {
+		return;
+	}
+	NSString *elementName = [element localName];
 	
 	if ([elementName isEqualToString:@"r"])
 	{
@@ -1756,6 +1998,9 @@
 	}
 	else if ([elementName isEqualToString:@"a"])
 	{
+		if (!isStarted) {
+			return;
+		}
 		// Try to process the ack.
 		// If we can't yet, then we'll put it into the pendingAcks array.
 		
@@ -1782,6 +2027,8 @@
 				resumptionId = [element attributeStringValueForName:@"id"];
 				max = [element attributeUInt32ValueForName:@"max" withDefaultValue:requestedMax];
 			}
+			boundJID = canResume && sender.isSecure ? sender.myJID.full : nil;
+			checkpointCountersValid = YES;
 			
 			[storage setResumptionId:resumptionId
 			                 timeout:max
@@ -1824,19 +2071,27 @@
 {
 	XMPPLogTrace();
 	
-	wasCleanDisconnect = YES;
+	if (sender == xmppStream) {
+		wasCleanDisconnect = YES;
+	}
 }
 
 - (void)xmppStreamDidDisconnect:(XMPPStream *)sender withError:(NSError *)error
 {
 	XMPPLogTrace();
+
+	if (sender != xmppStream) {
+		return;
+	}
+	XMPPStreamManagementResumeCheckpoint *checkpoint = nil;
 	
 	if (wasCleanDisconnect)
 	{
 		disconnectDate = nil;
 		[storage removeAllForStream:xmppStream];
+		self.stagedResume = nil;
 	}
-	else
+	else if (isStarted)
 	{
 		disconnectDate = [NSDate date];
 		NSArray *pending = [[NSArray alloc] initWithArray:unackedByServer copyItems:YES];
@@ -1846,8 +2101,38 @@
 		       lastHandledByServer:lastHandledByServer
 		    pendingOutgoingStanzas:pending
 		                 forStream:xmppStream];
+
+		if (checkpointCountersValid && boundJID.length > 0 && pending.count == 0 &&
+		    unprocessedReceivedAcks.count == 0 && outstandingStanzaIds == 0) {
+			NSString *resumptionId = nil;
+			uint32_t timeout = 0;
+			[storage getResumptionId:&resumptionId timeout:&timeout lastDisconnect:NULL forStream:xmppStream];
+			if (resumptionId.length > 0 && timeout > 0) {
+				checkpoint = [[XMPPStreamManagementResumeCheckpoint alloc] initWithResumptionID:resumptionId
+				                                                                        timeout:timeout
+				                                                                 lastDisconnect:disconnectDate
+				                                                            lastHandledByClient:lastHandledByClient
+				                                                            lastHandledByServer:lastHandledByServer
+				                                                                       boundJID:boundJID];
+			}
+		}
+	}
+	else if (self.attemptedCheckpoint) {
+		// The on-disk checkpoint has already been consumed. Do not retry it as
+		// a warm resume with no way for the app to identify the cold bootstrap.
+		[storage removeAllForStream:xmppStream];
+		boundJID = nil;
+		checkpointCountersValid = NO;
 	}
 	
+	[self resetAfterDisconnect];
+	if (checkpoint) {
+		[multicastDelegate xmppStreamManagement:self didPrepareResumeCheckpoint:checkpoint];
+	}
+}
+
+- (void)resetAfterDisconnect
+{
 	// Reset temporary state variables
 	
 	isStarted = NO;
@@ -1858,6 +2143,8 @@
 	
 	didAttemptResume = NO;
 	didResume = NO;
+	didResumeFromCheckpoint = NO;
+	self.attemptedCheckpoint = nil;
 	
 	prev_unackedByServer = nil;
 	

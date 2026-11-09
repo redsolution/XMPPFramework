@@ -7,6 +7,27 @@
 @class XMPPStreamManagementOutgoingStanza;
 
 NS_ASSUME_NONNULL_BEGIN
+
+/** A disconnected SM session with no outstanding outbound stanzas. */
+@interface XMPPStreamManagementResumeCheckpoint : NSObject
+
+- (instancetype)init NS_UNAVAILABLE;
+- (instancetype)initWithResumptionID:(NSString *)resumptionID
+                             timeout:(uint32_t)timeout
+                      lastDisconnect:(NSDate *)lastDisconnect
+                 lastHandledByClient:(uint32_t)lastHandledByClient
+                 lastHandledByServer:(uint32_t)lastHandledByServer
+                            boundJID:(NSString *)boundJID NS_DESIGNATED_INITIALIZER;
+
+@property (nonatomic, copy, readonly) NSString *resumptionID;
+@property (nonatomic, readonly) uint32_t timeout;
+@property (nonatomic, copy, readonly) NSDate *lastDisconnect;
+@property (nonatomic, readonly) uint32_t lastHandledByClient;
+@property (nonatomic, readonly) uint32_t lastHandledByServer;
+@property (nonatomic, copy, readonly) NSString *boundJID;
+
+@end
+
 @interface XMPPStreamManagement : XMPPModule <XMPPCustomBinding>
 
 /**
@@ -88,6 +109,25 @@ NS_ASSUME_NONNULL_BEGIN
  * needed if the stream was resumed (since the previous session state has been restored server-side).
 **/
 @property (atomic, readonly) BOOL didResume;
+
+/** YES when the last authentication resumed a previously restored checkpoint. */
+@property (atomic, readonly) BOOL didResumeFromCheckpoint;
+
+/**
+ * Stages a persisted checkpoint for the active, disconnected stream before connect.
+ * The caller is responsible for validating the account, credential, and endpoint.
+ * During binding, consume runs on the stream queue before sending the resume request
+ * or falling back to ordinary binding. Return YES only after retiring the checkpoint
+ * on disk. Returning NO aborts binding. The block must not wait for the module queue.
+ */
+- (BOOL)restoreResumeCheckpoint:(XMPPStreamManagementResumeCheckpoint *)checkpoint
+                        consume:(BOOL (^)(void))consume NS_SWIFT_NAME(restoreResumeCheckpoint(_:consume:));
+
+/** Clears an unsent checkpoint while disconnected without changing the warm resume state. */
+- (void)unstageResumeCheckpoint;
+
+/** Clears the staged checkpoint and the stored in-memory resumption state. */
+- (void)discardResumeCheckpoint;
 
 /**
  * This method is meant to be called when you receive an xmppStreamDidAuthenticate callback.
@@ -301,6 +341,15 @@ NS_ASSUME_NONNULL_BEGIN
 **/
 - (void)xmppStreamManagement:(XMPPStreamManagement *)sender wasEnabled:(NSXMLElement *)enabled;
 - (void)xmppStreamManagement:(XMPPStreamManagement *)sender wasNotEnabled:(NSXMLElement *)failed;
+
+/**
+ * Reports a transport disconnect with a coherent, fully acknowledged outbound queue.
+ * The caller must ensure inbound handling through lastHandledByClient is durable before
+ * saving the checkpoint. That count can include handled inbound stanzas whose ACK was
+ * not yet written to the socket. A closed XML stream cannot produce a checkpoint.
+ */
+- (void)xmppStreamManagement:(XMPPStreamManagement *)sender
+  didPrepareResumeCheckpoint:(XMPPStreamManagementResumeCheckpoint *)checkpoint;
 
 /**
  * Notifies delegates that a request <r/> for an ack from the server was sent.

@@ -94,6 +94,9 @@ extern NSString *const XMPPStreamDidChangeMyJIDNotification;
 **/
 - (void)sendBindElement:(NSXMLElement *)element;
 
+/** Restores the full JID supplied by the server for a successfully resumed binding. */
+- (void)setMyJID_setByServer:(XMPPJID *)newMyJID;
+
 /**
  * This method allows you to inject an element into the stream as if it was received on the socket.
  * This is an advanced technique, but makes for some interesting possibilities.
